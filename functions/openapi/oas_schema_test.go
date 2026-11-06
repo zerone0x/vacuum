@@ -688,3 +688,92 @@ func TestExtractLeafValidationErrors_StableAcrossCauseOrder(t *testing.T) {
 		assert.Contains(t, forward[1], "/beta")
 	}
 }
+
+func runOASSchemaWithDoctor(t *testing.T, yml string) []model.RuleFunctionResult {
+	t.Helper()
+	specInfo, err := datamodel.ExtractSpecInfo([]byte(yml))
+	assert.NoError(t, err)
+
+	rule := buildOpenApiTestRuleAction("$", "oas3_schema", "", nil)
+	ctx := buildOpenApiTestContext(model.CastToRuleAction(rule.Then), nil)
+	ctx.Index = index.NewSpecIndexWithConfig(specInfo.RootNode, index.CreateOpenAPIIndexConfig())
+	ctx.SpecInfo = specInfo
+	ctx.Document, err = libopenapi.NewDocument([]byte(yml))
+	assert.NoError(t, err)
+	m, _ := ctx.Document.BuildV3Model()
+	ctx.DrDocument = drModel.NewDrDocument(m)
+
+	return OASSchema{}.RunRule([]*yaml.Node{specInfo.RootNode}, ctx)
+}
+
+// https://github.com/daveshanley/vacuum/issues/1034
+func TestOASSchema_Issue1034_SingleErrorReportedOnceAtDocumentPath(t *testing.T) {
+	yml := `openapi: 3.0.3
+info: {title: Repro, version: 1.0.0}
+paths: {}
+components:
+  schemas:
+    Order:
+      type: object
+      properties:
+        token:
+          oneOf:
+            - type: string
+            - type: 'null'`
+
+	res := runOASSchemaWithDoctor(t, yml)
+
+	assert.Len(t, res, 1)
+	assert.Equal(t, "schema invalid: `/components/schemas/Order/properties/token/oneOf/1/type` value must be one of: `[array boolean integer number object string]`", res[0].Message)
+	assert.Equal(t, "$.components.schemas.Order.properties.token.oneOf[1].type", res[0].Path)
+	assert.Equal(t, 12, res[0].StartNode.Line)
+	assert.Equal(t, 21, res[0].StartNode.Column)
+}
+
+// https://github.com/daveshanley/vacuum/issues/1034
+func TestOASSchema_Issue1034_DistinctErrorsReportedSeparately(t *testing.T) {
+	yml := `openapi: 3.0.3
+info: {title: Repro, version: 1.0.0}
+paths: {}
+components:
+  schemas:
+    Order:
+      type: object
+      properties:
+        token:
+          oneOf:
+            - type: string
+            - type: 'null'
+    Pet:
+      type: object
+      properties:
+        name:
+          type: strin
+    Thing:
+      type: object
+      wat: 1`
+
+	res := runOASSchemaWithDoctor(t, yml)
+
+	assert.Len(t, res, 3)
+	byPath := make(map[string]model.RuleFunctionResult, len(res))
+	for _, r := range res {
+		byPath[r.Path] = r
+		assert.NotContains(t, r.Path, "$ref", "result path must be a document path, not a meta-schema path")
+	}
+
+	order, ok := byPath["$.components.schemas.Order.properties.token.oneOf[1].type"]
+	assert.True(t, ok)
+	assert.Equal(t, 12, order.StartNode.Line)
+	assert.Equal(t, "schema invalid: `/components/schemas/Order/properties/token/oneOf/1/type` value must be one of: `[array boolean integer number object string]`", order.Message)
+
+	pet, ok := byPath["$.components.schemas.Pet.properties.name.type"]
+	assert.True(t, ok)
+	assert.Equal(t, 17, pet.StartNode.Line)
+	assert.Equal(t, "schema invalid: `/components/schemas/Pet/properties/name/type` value must be one of: `[array boolean integer number object string]`", pet.Message)
+
+	thing, ok := byPath["$.components.schemas['Thing']"]
+	assert.True(t, ok)
+	assert.Equal(t, 18, thing.StartNode.Line)
+	assert.Equal(t, "schema invalid: `/components/schemas/Thing` additional properties not allowed: `[wat]`", thing.Message)
+}

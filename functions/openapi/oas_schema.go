@@ -24,7 +24,6 @@ import (
 	"github.com/pb33f/libopenapi-validator/helpers"
 	"github.com/pb33f/libopenapi-validator/schema_validation"
 	"github.com/pb33f/libopenapi/datamodel"
-	"github.com/pb33f/libopenapi/utils"
 )
 
 // ErrorClassification represents the semantic category of a validation error
@@ -345,17 +344,23 @@ func (os OASSchema) RunRule(nodes []*yaml.Node, context model.RuleFunctionContex
 			addResultToModelByLine(&res, context.DrDocument, validationErrors[i].SpecLine+1)
 			continue
 		}
-		for y := range validationErrors[i].SchemaValidationErrors {
-			if _, ok := seenSchemaFailures[hashResult(validationErrors[i].SchemaValidationErrors[y])]; ok {
+		// The validator flattens the error tree, so one bad keyword also yields failures for
+		// every ancestor schema that could not match a oneOf/anyOf branch (for example, the
+		// "missing property '$ref'" alternative). Classify each failure on its own error kind
+		// so those branch failures are dropped instead of repeated for every ancestor.
+		failures := validationErrors[i].SchemaValidationErrors
+		classified := classifySchemaFailures(failures)
+		for y := range failures {
+			schemaFailure := failures[y]
+			if _, ok := seenSchemaFailures[hashResult(schemaFailure)]; ok {
 				continue
 			}
-			if validationErrors[i].SchemaValidationErrors[y].Reason == "if-else failed" {
+			if schemaFailure.Reason == "if-else failed" {
 				continue
 			}
-			if validationErrors[i].SchemaValidationErrors[y].Reason == "if-then failed" {
+			if schemaFailure.Reason == "if-then failed" {
 				continue
 			}
-			schemaFailure := validationErrors[i].SchemaValidationErrors[y]
 			// The validator already retains the offending key and its instance path.
 			// Child errors are relative to the key string, not the API document.
 			if strings.HasSuffix(schemaFailure.KeywordLocation, "/propertyNames") && len(schemaFailure.InstancePath) > 0 {
@@ -365,20 +370,40 @@ func (os OASSchema) RunRule(nodes []*yaml.Node, context model.RuleFunctionContex
 				addResultToModelByLine(&res, context.DrDocument, res.StartNode.Line)
 				continue
 			}
-			_, location := utils.ConvertComponentIdIntoFriendlyPathSearch(validationErrors[i].SchemaValidationErrors[y].KeywordLocation)
+			failure := classified[y]
+			if failure.skip {
+				continue
+			}
+
+			// The instance location is the document location of the failure; a keyword
+			// location points into the OpenAPI meta-schema and is never a document path.
+			instanceNode := nodeAtInstancePath(validationInfo.RootNode, schemaFailure.InstancePath)
+			location := instancePathToJSONPath(schemaFailure.InstancePath, validationInfo.RootNode)
 			n := &yaml.Node{
-				Line:   validationErrors[i].SchemaValidationErrors[y].Line,
-				Column: validationErrors[i].SchemaValidationErrors[y].Column,
+				Line:   schemaFailure.Line,
+				Column: schemaFailure.Column,
 			}
 			var allPaths []string
 			var modelByLine []v3.Foundational
 			var modelErr error
 			if context.DrDocument != nil {
-				modelByLine, modelErr = context.DrDocument.LocateModelByLine(validationErrors[i].SchemaValidationErrors[y].Line + 1)
+				// Validator lines for mappings and sequences are the line of their key, so the
+				// model starts on the next line. Scalars report their own line, and no model
+				// describes a scalar, so attach them to the model that contains them.
+				modelLine := schemaFailure.Line + 1
+				if instanceNode != nil && instanceNode.Kind == yaml.ScalarNode {
+					modelLine = 0
+					if parent := nodeAtInstancePath(validationInfo.RootNode, parentInstancePath(schemaFailure.InstancePath)); parent != nil {
+						modelLine = parent.Line
+					}
+				}
+				modelByLine, modelErr = context.DrDocument.LocateModelByLine(modelLine)
 				if modelErr == nil {
 					if modelByLine != nil && len(modelByLine) >= 1 {
 						allPaths = append(allPaths, location)
-						location = modelByLine[0].GenerateJSONPath()
+						if instanceNode == nil || instanceNode.Kind != yaml.ScalarNode {
+							location = modelByLine[0].GenerateJSONPath()
+						}
 						for j := 0; j < len(modelByLine); j++ {
 							allPaths = append(allPaths, modelByLine[j].GenerateJSONPath())
 						}
@@ -386,30 +411,17 @@ func (os OASSchema) RunRule(nodes []*yaml.Node, context model.RuleFunctionContex
 				}
 			}
 
-			schemaErr := validationErrors[i].SchemaValidationErrors[y]
-			var reason string
+			reason := failure.reason
 
-			// Always prefer leaf error extraction from OriginalError when available (issue #766)
-			if schemaErr.OriginalJsonSchemaError != nil {
-				leafErrors := extractLeafValidationErrors(schemaErr.OriginalJsonSchemaError)
-				if len(leafErrors) > 0 {
-					// Limit to last 3 leaf errors for readability
-					if len(leafErrors) > 3 {
-						leafErrors = leafErrors[len(leafErrors)-3:]
-					}
-					reason = strings.Join(leafErrors, "; ")
-				}
-			}
-
-			if isNotValidationError(schemaErr) {
-				notReason := formatSchemaValidationReason(schemaErr, "violates `not`")
-				if notReason != schemaErr.Reason {
+			if isNotValidationError(schemaFailure) {
+				notReason := formatSchemaValidationReason(schemaFailure, "violates `not`")
+				if notReason != schemaFailure.Reason {
 					reason = notReason
 				}
 			}
 
 			if reason == "" {
-				reason = schemaErr.Reason
+				reason = schemaFailure.Reason
 			}
 
 			// guard against empty reason from upstream validator
@@ -432,10 +444,150 @@ func (os OASSchema) RunRule(nodes []*yaml.Node, context model.RuleFunctionContex
 					arr.AddRuleFunctionResult(v3.ConvertRuleResult(&res))
 				}
 			}
-			seenSchemaFailures[hashResult(validationErrors[i].SchemaValidationErrors[y])] = validationErrors[i].SchemaValidationErrors[y]
+			seenSchemaFailures[hashResult(schemaFailure)] = schemaFailure
 		}
 	}
 	return results
+}
+
+// classifiedSchemaFailure records how a single flattened validator failure should be reported.
+type classifiedSchemaFailure struct {
+	skip   bool
+	reason string
+}
+
+// schemaFailureKey identifies a flattened failure by its keyword and instance locations.
+func schemaFailureKey(keywordLocation string, instancePath []string) string {
+	return keywordLocation + "\x00" + strings.Join(instancePath, "\x00")
+}
+
+// indexSchemaFailureKinds maps each flattened failure of a validation error tree back to the
+// error kind that produced it, using the same flattening the validator uses.
+func indexSchemaFailureKinds(root *jsonschema.ValidationError) map[string]jsonschema.ErrorKind {
+	kinds := make(map[string]jsonschema.ErrorKind)
+	if root == nil {
+		return kinds
+	}
+	for _, unit := range root.BasicOutput().Errors {
+		if unit.Error == nil || unit.Error.Kind == nil {
+			continue
+		}
+		key := schemaFailureKey(unit.KeywordLocation, helpers.ConvertStringLocationToPathSegments(unit.InstanceLocation))
+		if _, ok := kinds[key]; !ok {
+			kinds[key] = unit.Error.Kind
+		}
+	}
+	return kinds
+}
+
+// classifySchemaFailures decides which flattened failures to report and builds each message
+// from that failure's own error kind, rather than from the whole document error tree.
+// Noise (unmatched oneOf/anyOf alternatives such as "missing property '$ref'") is dropped
+// when a real failure exists, and low-priority failures are dropped for instance locations
+// that already carry a high-priority failure (issues #766, #1034).
+func classifySchemaFailures(failures []*errors.SchemaValidationFailure) []classifiedSchemaFailure {
+	classified := make([]classifiedSchemaFailure, len(failures))
+	classes := make([]ErrorClassification, len(failures))
+	kindsByRoot := make(map[*jsonschema.ValidationError]map[string]jsonschema.ErrorKind)
+	highPriorityPaths := make(map[string]bool)
+	hasReportable := false
+
+	for i, failure := range failures {
+		classes[i] = ErrorClassHighPriority
+		if failure == nil {
+			continue
+		}
+		if root := failure.OriginalJsonSchemaError; root != nil {
+			kinds, ok := kindsByRoot[root]
+			if !ok {
+				kinds = indexSchemaFailureKinds(root)
+				kindsByRoot[root] = kinds
+			}
+			if k, found := kinds[schemaFailureKey(failure.KeywordLocation, failure.InstancePath)]; found {
+				ctx := ErrorContext{
+					SchemaURL:        failure.KeywordLocation,
+					InstanceLocation: unescapeJSONPointerSegments(failure.InstancePath),
+					ErrorKind:        k,
+					SchemaKeyword:    extractSchemaKeyword(failure.KeywordLocation),
+				}
+				classes[i] = ClassifyError(ctx)
+				if msg := defaultFormatter.Format(ctx); msg != "" {
+					classified[i].reason = "`" + ctx.InstancePath() + "` " + msg
+				}
+			}
+		}
+		if failure.Reason == "if-else failed" || failure.Reason == "if-then failed" {
+			continue
+		}
+		pathKey := strings.Join(failure.InstancePath, "\x00")
+		switch classes[i] {
+		case ErrorClassHighPriority:
+			highPriorityPaths[pathKey] = true
+			hasReportable = true
+		case ErrorClassLowPriority:
+			hasReportable = true
+		}
+	}
+
+	for i, failure := range failures {
+		if failure == nil {
+			classified[i].skip = true
+			continue
+		}
+		switch classes[i] {
+		case ErrorClassNoise:
+			// never drop every failure: if only noise remains, report it rather than nothing.
+			classified[i].skip = hasReportable
+		case ErrorClassLowPriority:
+			classified[i].skip = highPriorityPaths[strings.Join(failure.InstancePath, "\x00")]
+		}
+	}
+	return classified
+}
+
+// unescapeJSONPointerSegments decodes JSON pointer escapes in instance path segments.
+func unescapeJSONPointerSegments(segments []string) []string {
+	decoded := make([]string, len(segments))
+	for i, segment := range segments {
+		decoded[i] = strings.ReplaceAll(strings.ReplaceAll(segment, "~1", "/"), "~0", "~")
+	}
+	return decoded
+}
+
+// instancePathToJSONPath converts validator instance path segments into a document JSON path.
+func instancePathToJSONPath(instancePath []string, rootNode *yaml.Node) string {
+	if len(instancePath) == 0 {
+		return "$"
+	}
+	return jsonPointerToJSONPath("/"+strings.Join(instancePath, "/"), rootNode)
+}
+
+// parentInstancePath returns the instance path of the node containing the given path.
+func parentInstancePath(instancePath []string) []string {
+	if len(instancePath) == 0 {
+		return instancePath
+	}
+	return instancePath[:len(instancePath)-1]
+}
+
+// nodeAtInstancePath walks the document to the node at the given instance path segments.
+func nodeAtInstancePath(rootNode *yaml.Node, instancePath []string) *yaml.Node {
+	node := documentContentNode(rootNode)
+	for _, segment := range unescapeJSONPointerSegments(instancePath) {
+		if node == nil {
+			return nil
+		}
+		if node.Kind == yaml.SequenceNode {
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(node.Content) {
+				return nil
+			}
+			node = node.Content[index]
+			continue
+		}
+		node = mappingValueNode(node, segment)
+	}
+	return node
 }
 
 type modelByLineLocator interface {
